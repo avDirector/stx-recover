@@ -29,7 +29,12 @@ def find_ffmpeg():
     path = shutil.which("ffmpeg")
     if path:
         return path
-    for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]:
+    for candidate in [
+        os.path.expanduser("~/bin/ffmpeg"),
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ]:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
@@ -161,7 +166,11 @@ def parse_frame_number(data, pos):
 
 
 def parse_frame_index_lflac(data, first_flac, track_count):
-    """Parse stored frame index for original LFLAC format."""
+    """Parse stored frame index for original LFLAC format.
+
+    Returns (frame_index, boundary_offsets) where boundary_offsets is used for
+    frame boundary detection (same as frame_index for stored indices).
+    """
     header_offsets_start = 0xB0 + track_count * 0x13C + 8
     frame_index_start = header_offsets_start + track_count * 4
     offsets = []
@@ -174,11 +183,16 @@ def parse_frame_index_lflac(data, first_flac, track_count):
         pos += 4
     if not offsets:
         raise ValueError("No frame index table found in STX file.")
-    return offsets
+    return offsets, sorted(offsets)
 
 
 def parse_frame_index_lflc2(data, first_flac, track_count, header_size):
-    """Parse or reconstruct frame index for LFLC2 format."""
+    """Parse or reconstruct frame index for LFLC2 format.
+
+    Returns (frame_index, boundary_offsets) where boundary_offsets includes ALL
+    frame positions per group (not just the first track_count) for accurate frame
+    boundary detection when there are more actual tracks than detected.
+    """
     if header_size > BASE_HEADER_SIZE:
         return reconstruct_frame_index(data, first_flac, track_count, header_size)
 
@@ -213,11 +227,17 @@ def parse_frame_index_lflc2(data, first_flac, track_count, header_size):
 
     if not offsets:
         raise ValueError("No frame index table found in STX file.")
-    return offsets
+    return offsets, sorted(offsets)
 
 
 def reconstruct_frame_index(data, first_flac, track_count, header_size):
-    """Rebuild frame index by scanning sync codes (for broken stored indices)."""
+    """Rebuild frame index by scanning sync codes (for broken stored indices).
+
+    Returns (frame_index, boundary_offsets):
+    - frame_index: first track_count offsets per valid group (for extraction)
+    - boundary_offsets: ALL offsets per valid group (for frame boundary detection),
+      which correctly handles files with more actual tracks than detected.
+    """
     audio_start = first_flac + track_count * header_size
 
     # Pass 1: find most common block_size and channel codes
@@ -265,13 +285,15 @@ def reconstruct_frame_index(data, first_flac, track_count, header_size):
                 pos += 1
         else:
             pos += 1
-        if len(syncs) > 100000:
+        if len(syncs) > 2000000:
             break
 
     if not syncs:
         raise ValueError("No frame index table found in STX file.")
 
-    # Group by frame number, keep only groups with exactly track_count frames
+    # Group by frame number. Some files have more actual tracks than count_tracks()
+    # detected (later tracks have smaller header slots). Accept any group with at
+    # least track_count entries and take the first track_count (sorted by position).
     from collections import defaultdict
 
     groups = defaultdict(list)
@@ -279,13 +301,66 @@ def reconstruct_frame_index(data, first_flac, track_count, header_size):
         groups[fn].append(offset)
 
     offsets = []
+    all_offsets = []
     for fn in sorted(groups):
-        if len(groups[fn]) == track_count:
-            offsets.extend(groups[fn])
+        if len(groups[fn]) >= track_count:
+            sorted_group = sorted(groups[fn])
+            offsets.extend(sorted_group[:track_count])
+            all_offsets.extend(sorted_group)  # ALL entries — needed for correct boundaries
 
     if not offsets:
         raise ValueError("No frame index table found in STX file.")
-    return offsets
+    return offsets, sorted(all_offsets)
+
+
+def is_grouped_lflc2_format(data, first_flac, entries):
+    """Return True if entries are segment boundaries (new grouped format) vs per-frame offsets."""
+    if len(entries) < 2:
+        return False
+    # In the grouped format each entry spans a whole track-segment (multiple FLAC frames).
+    # Detect by counting sync codes between the first two entries.
+    start = first_flac + entries[0]
+    end = first_flac + entries[1]
+    count = 0
+    pos = start
+    while pos + 4 <= end and count < 2:
+        sync = (data[pos] << 8) | data[pos + 1]
+        if sync in (0xFFF8, 0xFFF9):
+            bs = data[pos + 2] >> 4
+            sr = data[pos + 2] & 0x0F
+            ch = data[pos + 3] >> 4
+            if bs > 0 and sr < 15 and ch <= 10:
+                count += 1
+                pos += 6
+                continue
+        pos += 1
+    return count >= 2
+
+
+def extract_track_bytes_grouped(data, first_flac, track_count, header_size, entries):
+    """
+    Extract raw audio bytes per track for the new grouped LFLC2 format.
+
+    entries[g*track_count + t] is the END offset (relative to first_flac) of
+    group g's track-t segment.  Audio begins at first_flac + track_count*header_size.
+
+    Returns a list of bytearrays, one per track (audio only, no FLAC header).
+    """
+    audio_start_rel = track_count * header_size
+    num_groups = len(entries) // track_count
+    track_bufs = [bytearray() for _ in range(track_count)]
+
+    for g in range(num_groups):
+        for t in range(track_count):
+            entry_idx = g * track_count + t
+            seg_start = audio_start_rel if (g == 0 and t == 0) else entries[entry_idx - 1]
+            seg_end = entries[entry_idx]
+            abs_start = first_flac + seg_start
+            abs_end = first_flac + seg_end
+            if abs_end > abs_start and abs_end <= len(data):
+                track_bufs[t].extend(data[abs_start:abs_end])
+
+    return track_bufs
 
 
 def find_frame_end(data, frame_start):
@@ -418,55 +493,129 @@ def convert_stx(stx_path, output_dir=None):
 
     # Multi-track: parse frame index
     if fmt == "lflac":
-        frame_index = parse_frame_index_lflac(data, first_flac, track_count)
+        frame_index, boundary_offsets = parse_frame_index_lflac(data, first_flac, track_count)
+        grouped = False
     else:
-        frame_index = parse_frame_index_lflc2(data, first_flac, track_count, header_size)
+        frame_index, boundary_offsets = parse_frame_index_lflc2(data, first_flac, track_count, header_size)
+        # Small-header LFLC2 files use a START-offset stored index (not an END-offset
+        # "grouped" chain).  The old is_grouped_lflc2_format heuristic mis-detected them
+        # as grouped because each stored segment contains multiple FLAC frames.
+        grouped = False
 
-    use_stored_index = header_size <= BASE_HEADER_SIZE
+    if grouped:
+        print(f"  (grouped LFLC2 — segment-per-track interleaving)")
+
+    use_stored_index = not grouped
     sample_rate = parse_sample_rate(data, first_flac)
     samples_per_frame = parse_block_size(data, first_flac)
-    sorted_offsets = sorted(frame_index)
+    # boundary_offsets includes ALL frame positions per group (including from extra
+    # tracks beyond track_count), ensuring correct frame end detection for track N-1.
+    sorted_offsets = boundary_offsets if not grouped else []
+
+    grouped_track_bytes = None  # grouped path disabled
+
+    # Pre-index gap: small-header LFLC2 files (e.g. ABeautifulJourney) store one track's
+    # initial frames (fn=0..X-1) in the region before the first stored frame index entry.
+    # Detect when exactly one track's first stored frame has fn > 0, and prepend the gap
+    # bytes to that track's audio so its stream starts at fn=0 with delay=0.
+    pre_gap_track = None
+    pre_gap_data = b""
+    if fmt == "lflc2" and header_size <= BASE_HEADER_SIZE and use_stored_index and frame_index:
+        audio_gap_start_abs = first_flac + track_count * header_size
+        first_idx_abs = first_flac + frame_index[0]
+        if first_idx_abs > audio_gap_start_abs:
+            late_tracks = []
+            for t in range(track_count):
+                t_frames = frame_index[t::track_count]
+                if t_frames:
+                    fn_t, sn_t = parse_frame_offset(data, first_flac + t_frames[0])
+                    sample_off = sn_t if sn_t > 0 else fn_t * samples_per_frame
+                    if sample_off > 0:
+                        late_tracks.append(t)
+            if len(late_tracks) == 1:
+                pre_gap_track = late_tracks[0]
+                pre_gap_data = bytes(data[audio_gap_start_abs:first_idx_abs])
 
     track_wavs = []
     track_delays = []
     temp_files = []
 
     for track in range(track_count):
-        track_frame_offsets = frame_index[track::track_count]
-        if not track_frame_offsets:
-            continue
-
         h_start = first_flac + track * header_size
         h_end = h_start + header_size
         if h_start < 0 or h_end > len(data):
             continue
 
-        track_data = bytearray(data[h_start:h_end])
-
-        # Calculate delay for stored indices
-        if use_stored_index and track_frame_offsets:
-            first_offset = track_frame_offsets[0]
-            frame_abs = first_flac + first_offset
-            frame_num, sample_num = parse_frame_offset(data, frame_abs)
-            sample_offset = sample_num if sample_num > 0 else frame_num * samples_per_frame
-            track_delays.append(sample_offset / sample_rate)
+        # For LFLC2 files, the stride between fLaC markers (header_size) may exceed the
+        # actual 1143-byte FLAC metadata.  The gap can contain the track's initial audio
+        # frames (fn=0, 1, 2, …) which precede the main interleaved audio area.  Include
+        # those frames up to the first backward fn jump, which marks a duplicate copy.
+        if fmt == "lflc2" and header_size > BASE_HEADER_SIZE:
+            extra_start = h_start + BASE_HEADER_SIZE
+            extra_data = data[extra_start:h_end]
+            prev_fn = -1
+            stop_pos = len(extra_data)       # assume include all until proven otherwise
+            pos = 0
+            while pos + 4 < len(extra_data):
+                sync = (extra_data[pos] << 8) | extra_data[pos + 1]
+                if sync in (0xFFF8, 0xFFF9):
+                    bs = extra_data[pos + 2] >> 4
+                    sr = extra_data[pos + 2] & 0x0F
+                    ch = extra_data[pos + 3] >> 4
+                    if bs > 0 and sr < 15 and ch <= 10:
+                        fn = parse_frame_number(extra_data, pos + 4)
+                        if fn >= 0:
+                            if fn <= prev_fn:
+                                stop_pos = pos   # backward jump → duplicate, stop here
+                                break
+                            prev_fn = fn
+                pos += 1
+            if prev_fn == -1:
+                stop_pos = 0  # no valid frames found — gap is empty/garbage, include nothing
+            track_data = bytearray(data[h_start : h_start + BASE_HEADER_SIZE])
+            track_data.extend(data[extra_start : extra_start + stop_pos])
         else:
+            track_data = bytearray(data[h_start:h_end])
+
+        if grouped:
+            track_data.extend(grouped_track_bytes[track])
             track_delays.append(0.0)
+        else:
+            track_frame_offsets = frame_index[track::track_count]
+            if not track_frame_offsets:
+                continue
 
-        # Extract frames
-        for offset in track_frame_offsets:
-            frame_start = first_flac + offset
-            if use_stored_index:
-                try:
-                    next_idx = next(i for i, o in enumerate(sorted_offsets) if o > offset)
-                    frame_end = first_flac + sorted_offsets[next_idx]
-                except StopIteration:
-                    frame_end = len(data)
+            # Calculate delay for stored indices
+            if pre_gap_track is not None and track == pre_gap_track:
+                # Pre-gap frames start at fn=0 — no delay needed
+                track_delays.append(0.0)
+            elif use_stored_index and header_size <= BASE_HEADER_SIZE and track_frame_offsets:
+                first_offset = track_frame_offsets[0]
+                frame_abs = first_flac + first_offset
+                frame_num, sample_num = parse_frame_offset(data, frame_abs)
+                sample_offset = sample_num if sample_num > 0 else frame_num * samples_per_frame
+                track_delays.append(sample_offset / sample_rate)
             else:
-                frame_end = find_frame_end(data, frame_start)
+                track_delays.append(0.0)
 
-            if 0 <= frame_start < len(data) and frame_end > frame_start and frame_end <= len(data):
-                track_data.extend(data[frame_start:frame_end])
+            # Prepend pre-index gap frames (fn=0..X-1) for the identified track
+            if pre_gap_track is not None and track == pre_gap_track:
+                track_data.extend(pre_gap_data)
+
+            # Extract frames
+            for offset in track_frame_offsets:
+                frame_start = first_flac + offset
+                if use_stored_index:
+                    try:
+                        next_idx = next(i for i, o in enumerate(sorted_offsets) if o > offset)
+                        frame_end = first_flac + sorted_offsets[next_idx]
+                    except StopIteration:
+                        frame_end = len(data)
+                else:
+                    frame_end = find_frame_end(data, frame_start)
+
+                if 0 <= frame_start < len(data) and frame_end > frame_start and frame_end <= len(data):
+                    track_data.extend(data[frame_start:frame_end])
 
         # Write temp FLAC and convert to WAV
         with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp:
